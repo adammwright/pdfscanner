@@ -13,6 +13,20 @@ const DEFAULT_KEYWORDS = [
   'soviet',
   'hong kong',
   'taiwan',
+  'christianity',
+  'judaism',
+  'mormon church',
+  "jehovah's witnesses",
+  'hinduism',
+  'sikhism',
+  'jainism',
+  "bahá'í faith",
+  'zoroastrianism',
+  'manichaeism',
+  'shinto',
+  'cheondoism',
+  'caidaism',
+  'wicca',
 ];
 
 let keywords = loadKeywords();
