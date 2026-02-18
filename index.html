@@ -330,7 +330,12 @@
         <h2>Results</h2>
         <p id="resultCount"></p>
       </div>
-      <button class="btn btn-success" onclick="downloadCSV()">⬇ Download CSV</button>
+      <div style="display:flex; gap:0.5rem; flex-wrap:wrap;">
+        <button class="btn btn-success" onclick="downloadCSV()">⬇ Download CSV</button>
+        <button class="btn btn-success" id="annotatedPdfBtn"
+                style="background:#b45309;"
+                onclick="downloadAnnotatedPDF()">⬇ Download Annotated PDF</button>
+      </div>
     </div>
     <div class="table-wrap">
       <table>
@@ -350,6 +355,7 @@
 
 <footer>Documents are never uploaded or stored — all processing happens locally in your browser.</footer>
 
+<script src="https://unpkg.com/pdf-lib@1.17.1/dist/pdf-lib.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 <script src="app.js"></script>
 

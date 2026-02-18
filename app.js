@@ -99,8 +99,9 @@ function setFile(file) {
 
 // ─── Scanning ────────────────────────────────────────────────────────────────
 
-let scanResults = [];
-let isScanning  = false;
+let scanResults  = [];
+let isScanning   = false;
+let lastRawBytes = null;  // Uint8Array of the last scanned PDF, kept for pdf-lib
 
 async function startScan() {
   if (!selectedFile || isScanning) return;
@@ -109,8 +110,9 @@ async function startScan() {
     return;
   }
 
-  isScanning   = true;
-  scanResults  = [];
+  isScanning    = true;
+  scanResults   = [];
+  lastRawBytes  = null;
 
   const scanBtn        = document.getElementById('scanBtn');
   const progressSec    = document.getElementById('progressSection');
@@ -126,8 +128,8 @@ async function startScan() {
   progressLabel.textContent = 'Loading PDF…';
 
   try {
-    const buffer = await selectedFile.arrayBuffer();
-    const pdf    = await pdfjsLib.getDocument({ data: buffer }).promise;
+    lastRawBytes = new Uint8Array(await selectedFile.arrayBuffer());
+    const pdf    = await pdfjsLib.getDocument({ data: lastRawBytes.slice() }).promise;
     const total  = pdf.numPages;
 
     // Track which pages have already been flagged for images (one row per page)
@@ -141,10 +143,26 @@ async function startScan() {
 
       const page = await pdf.getPage(pageNum);
 
-      // ── Text extraction ──────────────────────────────────────────────────
+      // ── Text extraction + character map ──────────────────────────────────
       const textContent = await page.getTextContent();
-      // Join items; PDF.js splits text at layout boundaries so we normalise spacing
-      const pageText = textContent.items.map(i => i.str).join(' ').replace(/\s+/g, ' ');
+      const items = textContent.items;
+
+      // Build charMap in parallel with the joined string so we can reverse-look-up
+      // which text item (and position within it) corresponds to any character index.
+      // charMap[i] = { itemIndex, charOffset }  (-1 means a manufactured space)
+      const charMap = [];
+      let pageText  = '';
+
+      for (let idx = 0; idx < items.length; idx++) {
+        if (idx > 0) {
+          charMap.push({ itemIndex: -1, charOffset: 0 });
+          pageText += ' ';
+        }
+        for (let ci = 0; ci < items[idx].str.length; ci++) {
+          charMap.push({ itemIndex: idx, charOffset: ci });
+          pageText += items[idx].str[ci];
+        }
+      }
 
       // ── Keyword search ───────────────────────────────────────────────────
       for (const keyword of keywords) {
@@ -161,11 +179,14 @@ async function startScan() {
             snippet +
             (end < pageText.length ? '…' : '');
 
+          const rects = computeHighlightRects(items, charMap, match.index, keyword.length);
+
           scanResults.push({
             keyword,
             page: pageNum,
             context,
             type: 'keyword',
+            rects,
           });
         }
       }
@@ -293,6 +314,151 @@ function escapeHtml(str) {
 
 function today() {
   return new Date().toISOString().slice(0, 10);
+}
+
+
+// ─── Highlight rectangle computation ─────────────────────────────────────────
+
+/**
+ * Compute bounding-box rectangles for a keyword match so pdf-lib can draw
+ * yellow highlights at the correct position on the page.
+ *
+ * @param {Array}  items      - textContent.items for the page (from PDF.js)
+ * @param {Array}  charMap    - parallel array: charMap[pos] = {itemIndex, charOffset}
+ * @param {number} matchStart - match.index from regex.exec()
+ * @param {number} matchLen   - keyword.length
+ * @returns {Array<{x, y, width, height}>}  one rect per spanned text item
+ */
+function computeHighlightRects(items, charMap, matchStart, matchLen) {
+  if (!charMap.length) return [];
+
+  const clampedStart = Math.min(matchStart, charMap.length - 1);
+  const clampedEnd   = Math.min(matchStart + matchLen - 1, charMap.length - 1);
+  const startEntry   = charMap[clampedStart];
+  const endEntry     = charMap[clampedEnd];
+
+  if (!startEntry || !endEntry) return [];
+  if (startEntry.itemIndex === -1 || endEntry.itemIndex === -1) return [];
+
+  // ── Case 1: entire match is within one text item ──────────────────────────
+  if (startEntry.itemIndex === endEntry.itemIndex) {
+    const item      = items[startEntry.itemIndex];
+    const charWidth = item.width / Math.max(item.str.length, 1);
+    return [{
+      x:      item.transform[4] + startEntry.charOffset * charWidth,
+      y:      item.transform[5],
+      width:  matchLen * charWidth,
+      height: item.height,
+    }];
+  }
+
+  // ── Case 2: match spans multiple text items ───────────────────────────────
+  const touched = new Set();
+  for (let pos = clampedStart; pos <= clampedEnd; pos++) {
+    if (charMap[pos].itemIndex !== -1) touched.add(charMap[pos].itemIndex);
+  }
+
+  return Array.from(touched).map(idx => {
+    const item      = items[idx];
+    const charWidth = item.width / Math.max(item.str.length, 1);
+
+    if (idx === startEntry.itemIndex) {
+      // Start item: x begins at the matched character
+      const xOff = startEntry.charOffset * charWidth;
+      return { x: item.transform[4] + xOff, y: item.transform[5],
+               width: item.width - xOff,    height: item.height };
+    }
+    if (idx === endEntry.itemIndex) {
+      // End item: x begins at item start, width covers only matched chars
+      return { x: item.transform[4], y: item.transform[5],
+               width: (endEntry.charOffset + 1) * charWidth, height: item.height };
+    }
+    // Middle items: highlight the full item
+    return { x: item.transform[4], y: item.transform[5],
+             width: item.width,    height: item.height };
+  });
+}
+
+
+// ─── Annotated PDF export ─────────────────────────────────────────────────────
+
+async function downloadAnnotatedPDF() {
+  if (!lastRawBytes || scanResults.length === 0) {
+    alert('Run a scan first, then download the annotated PDF.');
+    return;
+  }
+
+  const btn = document.getElementById('annotatedPdfBtn');
+  btn.disabled    = true;
+  btn.textContent = 'Building PDF…';
+
+  try {
+    const { PDFDocument, rgb } = window['PDFLib'];
+
+    // Load the original PDF into pdf-lib (uses a fresh copy of the bytes)
+    const pdfDoc = await PDFDocument.load(lastRawBytes);
+    const pages  = pdfDoc.getPages();
+
+    // ── Draw yellow highlights over keyword matches ────────────────────────
+    for (const result of scanResults) {
+      if (result.type !== 'keyword' || !result.rects?.length) continue;
+
+      const page = pages[result.page - 1];
+      if (!page) continue;
+
+      for (const rect of result.rects) {
+        if (rect.width <= 0 || rect.height <= 0) continue;
+        page.drawRectangle({
+          x:       rect.x,
+          y:       rect.y,
+          width:   rect.width,
+          height:  rect.height,
+          color:   rgb(1, 1, 0),   // yellow
+          opacity: 0.35,
+        });
+      }
+    }
+
+    // ── Draw amber image-detected labels in top-right corner ──────────────
+    for (const result of scanResults) {
+      if (result.type !== 'image') continue;
+
+      const page = pages[result.page - 1];
+      if (!page) continue;
+
+      const { width: pw, height: ph } = page.getSize();
+
+      page.drawRectangle({
+        x: pw - 162, y: ph - 32, width: 158, height: 24,
+        color: rgb(1, 0.8, 0), opacity: 0.92,
+      });
+      page.drawText('Image detected \u2013 check for maps', {
+        x: pw - 159, y: ph - 25,
+        size: 7,
+        color: rgb(0.2, 0.1, 0),
+      });
+    }
+
+    // ── Serialise and trigger download ────────────────────────────────────
+    const annotatedBytes = await pdfDoc.save();
+    const blob = new Blob([annotatedBytes], { type: 'application/pdf' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+
+    a.href     = url;
+    a.download = `scan-${selectedFile.name.replace(/\.pdf$/i, '')}-annotated-${today()}.pdf`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+
+  } catch (err) {
+    alert(`Could not build annotated PDF: ${err.message}`);
+    console.error(err);
+  } finally {
+    btn.disabled    = false;
+    btn.textContent = '⬇ Download Annotated PDF';
+  }
 }
 
 
